@@ -6,6 +6,9 @@
 #include <time.h>
 #include <stdarg.h>
 #include <sys/stat.h> // For mkdir function
+#include <fcntl.h> // For open, close, fcntl, flock
+#include <sys/file.h> // For flock
+#include <unistd.h> // For read
 
 // MySQL connection parameters
 #define HOST "localhost"
@@ -118,32 +121,96 @@ void login_callback(GtkWidget *widget, gpointer data) {
     }
 }
 
-// Authenticate user
+// Authenticate user with prepared statement
 int authenticate_user(const char *username, const char *password) {
-    char query[256];
-    snprintf(query, sizeof(query),
-             "SELECT user_id, username, password, role, member_id FROM Users "
-             "WHERE username = '%s' AND password = '%s'",
-             username, password);
-
-    if (mysql_query(conn, query)) {
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    if (!stmt) {
+        handle_database_error(conn, "Initializing prepared statement");
         return 0;
     }
 
-    MYSQL_RES *result = mysql_store_result(conn);
-    if (!result || mysql_num_rows(result) == 0) {
-        mysql_free_result(result);
+    const char *query = "SELECT user_id, username, password, role, member_id FROM Users WHERE username = ? AND password = ?";
+    if (mysql_stmt_prepare(stmt, query, strlen(query))) {
+        handle_database_error(conn, "Preparing statement");
+        mysql_stmt_close(stmt);
         return 0;
     }
 
-    MYSQL_ROW row = mysql_fetch_row(result);
-    current_user.user_id = atoi(row[0]);
-    strncpy(current_user.username, row[1], sizeof(current_user.username) - 1);
-    strncpy(current_user.password, row[2], sizeof(current_user.password) - 1);
-    current_user.role = atoi(row[3]);
-    current_user.member_id = row[4] ? atoi(row[4]) : 0;
+    MYSQL_BIND bind[2];
+    memset(bind, 0, sizeof(bind));
 
-    mysql_free_result(result);
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void *)username;
+    bind[0].buffer_length = strlen(username);
+    bind[0].is_null = 0;
+
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (void *)password;
+    bind[1].buffer_length = strlen(password);
+    bind[1].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind)) {
+        handle_database_error(conn, "Binding parameters");
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    if (mysql_stmt_execute(stmt)) {
+        handle_database_error(conn, "Executing statement");
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    MYSQL_BIND result_bind[5];
+    memset(result_bind, 0, sizeof(result_bind));
+
+    int user_id;
+    char username_buf[50];
+    char password_buf[50];
+    int role;
+    int member_id;
+    my_bool is_null[5] = {0};
+
+    result_bind[0].buffer_type = MYSQL_TYPE_LONG;
+    result_bind[0].buffer = &user_id;
+    result_bind[0].is_null = &is_null[0];
+
+    result_bind[1].buffer_type = MYSQL_TYPE_STRING;
+    result_bind[1].buffer = username_buf;
+    result_bind[1].buffer_length = sizeof(username_buf);
+    result_bind[1].is_null = &is_null[1];
+
+    result_bind[2].buffer_type = MYSQL_TYPE_STRING;
+    result_bind[2].buffer = password_buf;
+    result_bind[2].buffer_length = sizeof(password_buf);
+    result_bind[2].is_null = &is_null[2];
+
+    result_bind[3].buffer_type = MYSQL_TYPE_LONG;
+    result_bind[3].buffer = &role;
+    result_bind[3].is_null = &is_null[3];
+
+    result_bind[4].buffer_type = MYSQL_TYPE_LONG;
+    result_bind[4].buffer = &member_id;
+    result_bind[4].is_null = &is_null[4];
+
+    if (mysql_stmt_bind_result(stmt, result_bind)) {
+        handle_database_error(conn, "Binding results");
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    if (mysql_stmt_fetch(stmt)) {
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    current_user.user_id = user_id;
+    strncpy(current_user.username, username_buf, sizeof(current_user.username) - 1);
+    strncpy(current_user.password, password_buf, sizeof(current_user.password) - 1);
+    current_user.role = role;
+    current_user.member_id = member_id;
+
+    mysql_stmt_close(stmt);
     return 1;
 }
 
@@ -170,15 +237,25 @@ void log_transaction(const char *action, const char *details) {
     fclose(log_file);
 }
 
-// Handle MySQL errors
+// Handle MySQL errors with proper cleanup
 void finish_with_error(GtkWidget *parent) {
-    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(parent), GTK_DIALOG_MODAL,
-                                              GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
-                                              "MySQL Error: %s", mysql_error(conn));
+    const char *error = mysql_error(conn);
+    GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(parent),
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_ERROR,
+                                              GTK_BUTTONS_OK,
+                                              "MySQL Error: %s", error);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
-    mysql_close(conn);
-    exit(1);
+    
+    // Clean up database connection
+    if (conn) {
+        mysql_close(conn);
+        conn = NULL;
+    }
+    
+    // Clean up GTK
+    gtk_main_quit();
 }
 
 // Generic list function for displaying results in a text view
@@ -215,22 +292,69 @@ void list_records(GtkWidget *widget, gpointer data) {
     log_transaction(params->action, "Listed records");
 }
 
-// Add Author
+// Add Author with prepared statement
 void add_author_cb(GtkWidget *widget, gpointer data) {
     GtkWidget **entries = (GtkWidget **)data;
     const char *name = gtk_entry_get_text(GTK_ENTRY(entries[0]));
     const char *bio = gtk_entry_get_text(GTK_ENTRY(entries[1]));
 
-    char query[2048];
-    snprintf(query, sizeof(query), "INSERT INTO Authors (name, bio) VALUES ('%s', '%s')", name, bio);
-
-    if (mysql_query(conn, query)) {
-        finish_with_error(gtk_widget_get_toplevel(widget));
+    // Validate input
+    if (!name || !bio) {
+        GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+                                                  GTK_DIALOG_MODAL,
+                                                  GTK_MESSAGE_ERROR,
+                                                  GTK_BUTTONS_OK,
+                                                  "Please fill in all required fields!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        return;
     }
+
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    if (!stmt) {
+        handle_database_error(conn, "Initializing prepared statement");
+        return;
+    }
+
+    const char *query = "INSERT INTO Authors (name, bio) VALUES (?, ?)";
+    if (mysql_stmt_prepare(stmt, query, strlen(query))) {
+        handle_database_error(conn, "Preparing statement");
+        mysql_stmt_close(stmt);
+        return;
+    }
+
+    MYSQL_BIND bind[2];
+    memset(bind, 0, sizeof(bind));
+
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void *)name;
+    bind[0].buffer_length = strlen(name);
+    bind[0].is_null = 0;
+
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (void *)bio;
+    bind[1].buffer_length = strlen(bio);
+    bind[1].is_null = 0;
+
+    if (mysql_stmt_bind_param(stmt, bind)) {
+        handle_database_error(conn, "Binding parameters");
+        mysql_stmt_close(stmt);
+        return;
+    }
+
+    if (mysql_stmt_execute(stmt)) {
+        handle_database_error(conn, "Executing statement");
+        mysql_stmt_close(stmt);
+        return;
+    }
+
+    mysql_stmt_close(stmt);
 
     log_transaction("Add Author", name);
     GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
-                                              GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_INFO,
+                                              GTK_BUTTONS_OK,
                                               "Author '%s' added successfully!", name);
     gtk_dialog_run(GTK_DIALOG(dialog));
     gtk_widget_destroy(dialog);
@@ -658,46 +782,111 @@ typedef struct {
     int pending_fines;
 } DashboardStats;
 
-// Create interactive table view
+// Create interactive table view with proper memory management
 GtkWidget* create_table_view(const char* title, const char* query, int num_columns, const char** column_names) {
     GtkWidget* window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    if (!window) {
+        handle_memory_error();
+        return NULL;
+    }
+    
     gtk_window_set_title(GTK_WINDOW(window), title);
     gtk_window_set_default_size(GTK_WINDOW(window), 800, 600);
     
     GtkWidget* vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    if (!vbox) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
     gtk_container_add(GTK_CONTAINER(window), vbox);
     
     // Search box
     GtkWidget* search_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    if (!search_box) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     GtkWidget* search_entry = gtk_entry_new();
+    if (!search_entry) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
     gtk_entry_set_placeholder_text(GTK_ENTRY(search_entry), "Search...");
+    
     GtkWidget* search_button = gtk_button_new_with_label("Search");
+    if (!search_button) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     gtk_box_pack_start(GTK_BOX(search_box), search_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(search_box), search_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), search_box, FALSE, FALSE, 0);
     
     // Create tree view
     GtkWidget* scrolled_window = gtk_scrolled_window_new(NULL, NULL);
+    if (!scrolled_window) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window),
                                  GTK_POLICY_AUTOMATIC,
                                  GTK_POLICY_AUTOMATIC);
     
     // Create store with correct number of columns
     GType* types = g_new(GType, num_columns);
+    if (!types) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     for (int i = 0; i < num_columns; i++) {
         types[i] = G_TYPE_STRING;
     }
+    
     GtkListStore* store = gtk_list_store_newv(num_columns, types);
     g_free(types);
+    
+    if (!store) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
     
     GtkWidget* tree_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(store));
     g_object_unref(store); // Unref the store as tree_view now owns it
     
+    if (!tree_view) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     // Add columns
     for (int i = 0; i < num_columns; i++) {
         GtkCellRenderer* renderer = gtk_cell_renderer_text_new();
+        if (!renderer) {
+            gtk_widget_destroy(window);
+            handle_memory_error();
+            return NULL;
+        }
+        
         GtkTreeViewColumn* column = gtk_tree_view_column_new_with_attributes(
             column_names[i], renderer, "text", i, NULL);
+        if (!column) {
+            gtk_widget_destroy(window);
+            handle_memory_error();
+            return NULL;
+        }
+        
         gtk_tree_view_append_column(GTK_TREE_VIEW(tree_view), column);
     }
     
@@ -706,10 +895,22 @@ GtkWidget* create_table_view(const char* title, const char* query, int num_colum
     
     // Action buttons
     GtkWidget* button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+    if (!button_box) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
+    
     GtkWidget* add_button = gtk_button_new_with_label("Add New");
     GtkWidget* edit_button = gtk_button_new_with_label("Edit");
     GtkWidget* delete_button = gtk_button_new_with_label("Delete");
     GtkWidget* refresh_button = gtk_button_new_with_label("Refresh");
+    
+    if (!add_button || !edit_button || !delete_button || !refresh_button) {
+        gtk_widget_destroy(window);
+        handle_memory_error();
+        return NULL;
+    }
     
     gtk_box_pack_start(GTK_BOX(button_box), add_button, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(button_box), edit_button, TRUE, TRUE, 0);
@@ -717,30 +918,140 @@ GtkWidget* create_table_view(const char* title, const char* query, int num_colum
     gtk_box_pack_start(GTK_BOX(button_box), refresh_button, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(vbox), button_box, FALSE, FALSE, 0);
     
-    // Load data
-    if (mysql_query(conn, query)) {
-        handle_database_error(conn, "Loading table data");
+    // Load data using prepared statement
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    if (!stmt) {
         gtk_widget_destroy(window);
+        handle_database_error(conn, "Initializing prepared statement");
         return NULL;
     }
     
-    MYSQL_RES* result = mysql_store_result(conn);
+    if (mysql_stmt_prepare(stmt, query, strlen(query))) {
+        gtk_widget_destroy(window);
+        handle_database_error(conn, "Preparing statement");
+        mysql_stmt_close(stmt);
+        return NULL;
+    }
+    
+    if (mysql_stmt_execute(stmt)) {
+        gtk_widget_destroy(window);
+        handle_database_error(conn, "Executing statement");
+        mysql_stmt_close(stmt);
+        return NULL;
+    }
+    
+    MYSQL_RES* result = mysql_stmt_result_metadata(stmt);
     if (!result) {
-        handle_database_error(conn, "Storing result");
         gtk_widget_destroy(window);
+        handle_database_error(conn, "Getting result metadata");
+        mysql_stmt_close(stmt);
         return NULL;
     }
     
-    MYSQL_ROW row;
-    while ((row = mysql_fetch_row(result))) {
+    MYSQL_BIND* bind = g_new(MYSQL_BIND, num_columns);
+    if (!bind) {
+        gtk_widget_destroy(window);
+        mysql_free_result(result);
+        mysql_stmt_close(stmt);
+        handle_memory_error();
+        return NULL;
+    }
+    
+    char** data = g_new(char*, num_columns);
+    if (!data) {
+        gtk_widget_destroy(window);
+        g_free(bind);
+        mysql_free_result(result);
+        mysql_stmt_close(stmt);
+        handle_memory_error();
+        return NULL;
+    }
+    
+    unsigned long* lengths = g_new(unsigned long, num_columns);
+    if (!lengths) {
+        gtk_widget_destroy(window);
+        g_free(data);
+        g_free(bind);
+        mysql_free_result(result);
+        mysql_stmt_close(stmt);
+        handle_memory_error();
+        return NULL;
+    }
+    
+    my_bool* is_null = g_new(my_bool, num_columns);
+    if (!is_null) {
+        gtk_widget_destroy(window);
+        g_free(lengths);
+        g_free(data);
+        g_free(bind);
+        mysql_free_result(result);
+        mysql_stmt_close(stmt);
+        handle_memory_error();
+        return NULL;
+    }
+    
+    for (int i = 0; i < num_columns; i++) {
+        data[i] = g_new(char, 256); // Maximum field length
+        if (!data[i]) {
+            for (int j = 0; j < i; j++) {
+                g_free(data[j]);
+            }
+            gtk_widget_destroy(window);
+            g_free(is_null);
+            g_free(lengths);
+            g_free(data);
+            g_free(bind);
+            mysql_free_result(result);
+            mysql_stmt_close(stmt);
+            handle_memory_error();
+            return NULL;
+        }
+        
+        bind[i].buffer_type = MYSQL_TYPE_STRING;
+        bind[i].buffer = data[i];
+        bind[i].buffer_length = 256;
+        bind[i].length = &lengths[i];
+        bind[i].is_null = &is_null[i];
+    }
+    
+    if (mysql_stmt_bind_result(stmt, bind)) {
+        for (int i = 0; i < num_columns; i++) {
+            g_free(data[i]);
+        }
+        gtk_widget_destroy(window);
+        g_free(is_null);
+        g_free(lengths);
+        g_free(data);
+        g_free(bind);
+        mysql_free_result(result);
+        mysql_stmt_close(stmt);
+        handle_database_error(conn, "Binding results");
+        return NULL;
+    }
+    
+    while (mysql_stmt_fetch(stmt) == 0) {
         GtkTreeIter iter;
         gtk_list_store_append(store, &iter);
         for (int i = 0; i < num_columns; i++) {
-            gtk_list_store_set(store, &iter, i, row[i] ? row[i] : "NULL", -1);
+            if (!is_null[i]) {
+                gtk_list_store_set(store, &iter, i, data[i], -1);
+            } else {
+                gtk_list_store_set(store, &iter, i, "NULL", -1);
+            }
         }
     }
     
+    // Clean up
+    for (int i = 0; i < num_columns; i++) {
+        g_free(data[i]);
+    }
+    g_free(is_null);
+    g_free(lengths);
+    g_free(data);
+    g_free(bind);
     mysql_free_result(result);
+    mysql_stmt_close(stmt);
+    
     gtk_widget_show_all(window);
     return window;
 }
@@ -900,6 +1211,7 @@ void show_users_view(GtkWidget* widget, gpointer data) {
         5, column_names);
 }
 
+// Add user with prepared statement
 void add_user_cb(GtkWidget* widget, gpointer data) {
     GtkWidget** entries = (GtkWidget **)data;
     const char* username = gtk_entry_get_text(GTK_ENTRY(entries[0]));
@@ -919,38 +1231,55 @@ void add_user_cb(GtkWidget* widget, gpointer data) {
         return;
     }
 
-    // Check if username already exists
-    char query[256];
-    snprintf(query, sizeof(query), "SELECT user_id FROM Users WHERE username = '%s'", username);
-    if (mysql_query(conn, query)) {
-        handle_database_error(conn, "Checking username");
+    MYSQL_STMT *stmt = mysql_stmt_init(conn);
+    if (!stmt) {
+        handle_database_error(conn, "Initializing prepared statement");
         return;
     }
 
-    MYSQL_RES* result = mysql_store_result(conn);
-    if (result && mysql_num_rows(result) > 0) {
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
-                                                  GTK_DIALOG_MODAL,
-                                                  GTK_MESSAGE_ERROR,
-                                                  GTK_BUTTONS_OK,
-                                                  "Username already exists!");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-        mysql_free_result(result);
+    const char *query = "INSERT INTO Users (username, password, role, member_id) VALUES (?, ?, ?, ?)";
+    if (mysql_stmt_prepare(stmt, query, strlen(query))) {
+        handle_database_error(conn, "Preparing statement");
+        mysql_stmt_close(stmt);
         return;
     }
-    mysql_free_result(result);
 
-    // Insert new user
-    snprintf(query, sizeof(query),
-             "INSERT INTO Users (username, password, role, member_id) "
-             "VALUES ('%s', '%s', %s, %s)",
-             username, password, role, member_id ? member_id : "NULL");
+    MYSQL_BIND bind[4];
+    memset(bind, 0, sizeof(bind));
 
-    if (mysql_query(conn, query)) {
-        handle_database_error(conn, "Adding user");
+    bind[0].buffer_type = MYSQL_TYPE_STRING;
+    bind[0].buffer = (void *)username;
+    bind[0].buffer_length = strlen(username);
+    bind[0].is_null = 0;
+
+    bind[1].buffer_type = MYSQL_TYPE_STRING;
+    bind[1].buffer = (void *)password;
+    bind[1].buffer_length = strlen(password);
+    bind[1].is_null = 0;
+
+    int role_val = atoi(role);
+    bind[2].buffer_type = MYSQL_TYPE_LONG;
+    bind[2].buffer = &role_val;
+    bind[2].is_null = 0;
+
+    int member_id_val = member_id ? atoi(member_id) : 0;
+    bind[3].buffer_type = MYSQL_TYPE_LONG;
+    bind[3].buffer = &member_id_val;
+    bind[3].is_null = member_id ? 0 : 1;
+
+    if (mysql_stmt_bind_param(stmt, bind)) {
+        handle_database_error(conn, "Binding parameters");
+        mysql_stmt_close(stmt);
         return;
     }
+
+    if (mysql_stmt_execute(stmt)) {
+        handle_database_error(conn, "Executing statement");
+        mysql_stmt_close(stmt);
+        return;
+    }
+
+    mysql_stmt_close(stmt);
 
     log_transaction("Add User", username);
     GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
@@ -1165,38 +1494,45 @@ void show_system_logs(GtkWidget* widget, gpointer data) {
     gtk_widget_show_all(window);
 }
 
-void backup_database(GtkWidget* widget, gpointer data) {
+// Backup database with proper error handling
+void backup_database(GtkWidget *widget, gpointer data) {
     // Create backup directory if it doesn't exist
-    if (mkdir("backups", 0755) != 0 && errno != EEXIST) {
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+    const char *backup_dir = "backups";
+    if (mkdir(backup_dir, 0755) != 0 && errno != EEXIST) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
                                                   GTK_DIALOG_MODAL,
                                                   GTK_MESSAGE_ERROR,
                                                   GTK_BUTTONS_OK,
-                                                  "Failed to create backup directory: %s", strerror(errno));
+                                                  "Failed to create backup directory: %s",
+                                                  strerror(errno));
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
         return;
     }
-    
+
     // Generate backup filename with timestamp
     time_t now = time(NULL);
-    struct tm* t = localtime(&now);
+    struct tm *t = localtime(&now);
     char backup_file[256];
-    strftime(backup_file, sizeof(backup_file), "backups/library_%Y%m%d_%H%M%S.sql", t);
-    
-    // Create backup command with proper escaping
-    char* escaped_host = g_shell_quote(HOST);
-    char* escaped_user = g_shell_quote(USER);
-    char* escaped_pass = g_shell_quote(PASS);
-    char* escaped_db = g_shell_quote(DB);
-    char* escaped_file = g_shell_quote(backup_file);
-    
-    char* command = g_strdup_printf("mysqldump -h %s -u %s -p%s %s > %s",
-                                   escaped_host, escaped_user, escaped_pass, escaped_db, escaped_file);
-    
-    // Execute backup
+    snprintf(backup_file, sizeof(backup_file), "%s/backup_%04d%02d%02d_%02d%02d%02d.sql",
+             backup_dir, t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+
+    // Escape database parameters to prevent command injection
+    char *escaped_host = g_shell_quote(HOST);
+    char *escaped_user = g_shell_quote(USER);
+    char *escaped_pass = g_shell_quote(PASS);
+    char *escaped_db = g_shell_quote(DB);
+    char *escaped_file = g_shell_quote(backup_file);
+
+    // Construct backup command
+    char *command = g_strdup_printf("mysqldump -h %s -u %s -p%s %s > %s",
+                                   escaped_host, escaped_user, escaped_pass,
+                                   escaped_db, escaped_file);
+
+    // Execute backup command
     int result = system(command);
-    
+
     // Free allocated memory
     g_free(escaped_host);
     g_free(escaped_user);
@@ -1204,21 +1540,23 @@ void backup_database(GtkWidget* widget, gpointer data) {
     g_free(escaped_db);
     g_free(escaped_file);
     g_free(command);
-    
+
+    // Check backup result
     if (result == 0) {
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
                                                   GTK_DIALOG_MODAL,
                                                   GTK_MESSAGE_INFO,
                                                   GTK_BUTTONS_OK,
-                                                  "Database backup created successfully: %s", backup_file);
+                                                  "Database backup created successfully!\nBackup file: %s",
+                                                  backup_file);
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
     } else {
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(gtk_widget_get_toplevel(widget)),
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
                                                   GTK_DIALOG_MODAL,
                                                   GTK_MESSAGE_ERROR,
                                                   GTK_BUTTONS_OK,
-                                                  "Failed to create database backup! Error code: %d", result);
+                                                  "Failed to create database backup!");
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
     }
@@ -1282,86 +1620,138 @@ int get_total_operations(void) {
     return count;
 }
 
+// Get system uptime with proper file locking
 int get_system_uptime(void) {
-    // Get system start time from a file
-    FILE* uptime_file = fopen("system_start_time", "r");
-    if (!uptime_file) return 0;
+    const char *uptime_file = "system_start_time";
+    int uptime = 0;
     
+    // Open file with exclusive lock
+    int fd = open(uptime_file, O_RDONLY);
+    if (fd == -1) {
+        return 0;
+    }
+    
+    // Try to get exclusive lock
+    struct flock fl = {
+        .l_type = F_RDLCK,
+        .l_whence = SEEK_SET,
+        .l_start = 0,
+        .l_len = 0
+    };
+    
+    if (fcntl(fd, F_SETLKW, &fl) == -1) {
+        close(fd);
+        return 0;
+    }
+    
+    // Read start time
     time_t start_time;
-    fscanf(uptime_file, "%ld", &start_time);
-    fclose(uptime_file);
+    if (read(fd, &start_time, sizeof(start_time)) == sizeof(start_time)) {
+        time_t now = time(NULL);
+        uptime = (int)(now - start_time) / 3600; // Return uptime in hours
+    }
     
-    time_t now = time(NULL);
-    return (int)(now - start_time) / 3600; // Return uptime in hours
+    // Release lock
+    fl.l_type = F_UNLCK;
+    fcntl(fd, F_SETLK, &fl);
+    close(fd);
+    
+    return uptime;
 }
 
-// Save system settings
-void save_system_settings(GtkWidget* widget, gpointer data) {
-    GtkWidget* window = gtk_widget_get_toplevel(widget);
-    GtkWidget* vbox = gtk_bin_get_child(GTK_BIN(window));
-    
-    // Get database frame and its child
-    GtkWidget* db_frame = gtk_bin_get_child(GTK_BIN(vbox));
-    GtkWidget* db_box = gtk_bin_get_child(GTK_BIN(db_frame));
-    
-    // Get database settings entries
-    GtkWidget* host_entry = gtk_bin_get_child(GTK_BIN(db_box));
-    GtkWidget* user_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_box))));
-    GtkWidget* pass_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_box))))));
-    GtkWidget* db_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_box))))))));
-    
-    // Get system frame and its child
-    GtkWidget* sys_frame = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(vbox))));
-    GtkWidget* sys_box = gtk_bin_get_child(GTK_BIN(sys_frame));
-    
-    // Get system settings widgets
-    GtkWidget* log_level_combo = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))));
-    GtkWidget* auto_backup_check = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))))));
-    GtkWidget* backup_interval_spin = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))))))));
-    
-    const char* host = gtk_entry_get_text(GTK_ENTRY(host_entry));
-    const char* user = gtk_entry_get_text(GTK_ENTRY(user_entry));
-    const char* pass = gtk_entry_get_text(GTK_ENTRY(pass_entry));
-    const char* db = gtk_entry_get_text(GTK_ENTRY(db_entry));
-    
-    const char* log_level = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(log_level_combo));
-    gboolean auto_backup = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(auto_backup_check));
-    int backup_interval = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(backup_interval_spin));
-    
-    // Save settings to configuration file
-    FILE* config_file = fopen("library_config.ini", "w");
-    if (config_file) {
-        fprintf(config_file, "[Database]\n");
-        fprintf(config_file, "host = %s\n", host);
-        fprintf(config_file, "user = %s\n", user);
-        fprintf(config_file, "pass = %s\n", pass);
-        fprintf(config_file, "db = %s\n", db);
-        
-        fprintf(config_file, "\n[System]\n");
-        fprintf(config_file, "log_level = %s\n", log_level);
-        fprintf(config_file, "auto_backup = %s\n", auto_backup ? "true" : "false");
-        fprintf(config_file, "backup_interval = %d\n", backup_interval);
-        
-        fclose(config_file);
-        
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(window),
-                                                  GTK_DIALOG_MODAL,
-                                                  GTK_MESSAGE_INFO,
-                                                  GTK_BUTTONS_OK,
-                                                  "Settings saved successfully!");
-        gtk_dialog_run(GTK_DIALOG(dialog));
-        gtk_widget_destroy(dialog);
-    } else {
-        GtkWidget* dialog = gtk_message_dialog_new(GTK_WINDOW(window),
+// Handle file operations with proper error checking
+int safe_file_operation(const char *filename, const char *mode, const char *operation) {
+    FILE *file = fopen(filename, mode);
+    if (!file) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
                                                   GTK_DIALOG_MODAL,
                                                   GTK_MESSAGE_ERROR,
                                                   GTK_BUTTONS_OK,
-                                                  "Failed to save settings!");
+                                                  "Failed to %s file '%s': %s",
+                                                  operation, filename, strerror(errno));
         gtk_dialog_run(GTK_DIALOG(dialog));
         gtk_widget_destroy(dialog);
+        return 0;
     }
+    fclose(file);
+    return 1;
+}
+
+// Save system settings with proper error handling
+void save_system_settings(GtkWidget *widget, gpointer data) {
+    const char *config_file = "library_config.ini";
     
+    // Check if we can write to the config file
+    if (!safe_file_operation(config_file, "w", "write to")) {
+        return;
+    }
+
+    // Get database settings
+    GtkWidget *window = gtk_widget_get_toplevel(widget);
+    GtkWidget *vbox = gtk_bin_get_child(GTK_BIN(window));
+    GtkWidget *db_frame = gtk_bin_get_child(GTK_BIN(vbox));
+    GtkWidget *db_vbox = gtk_bin_get_child(GTK_BIN(db_frame));
+    
+    GtkWidget *host_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_vbox))));
+    GtkWidget *user_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_vbox))))));
+    GtkWidget *pass_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_vbox))))))));
+    GtkWidget *db_entry = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(db_vbox)))))))));
+
+    const char *host = gtk_entry_get_text(GTK_ENTRY(host_entry));
+    const char *user = gtk_entry_get_text(GTK_ENTRY(user_entry));
+    const char *pass = gtk_entry_get_text(GTK_ENTRY(pass_entry));
+    const char *db = gtk_entry_get_text(GTK_ENTRY(db_entry));
+
+    // Get system settings
+    GtkWidget *sys_frame = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(vbox))));
+    GtkWidget *sys_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(sys_frame), sys_box);
+    
+    GtkWidget *log_level_combo = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))));
+    GtkWidget *auto_backup_check = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))))));
+    GtkWidget *backup_interval_spin = gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(gtk_bin_get_child(GTK_BIN(sys_box))))))));
+
+    const char *log_level = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(log_level_combo));
+    gboolean auto_backup = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(auto_backup_check));
+    int backup_interval = gtk_spin_button_get_value_as_int(GTK_SPIN_BUTTON(backup_interval_spin));
+
+    // Open config file for writing
+    FILE *file = fopen(config_file, "w");
+    if (!file) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                                                  GTK_DIALOG_MODAL,
+                                                  GTK_MESSAGE_ERROR,
+                                                  GTK_BUTTONS_OK,
+                                                  "Failed to open config file for writing!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
+        g_free((gpointer)log_level);
+        return;
+    }
+
+    // Write settings to file
+    fprintf(file, "[Database]\n");
+    fprintf(file, "host = %s\n", host);
+    fprintf(file, "user = %s\n", user);
+    fprintf(file, "password = %s\n", pass);
+    fprintf(file, "database = %s\n\n", db);
+
+    fprintf(file, "[System]\n");
+    fprintf(file, "log_level = %s\n", log_level);
+    fprintf(file, "auto_backup = %s\n", auto_backup ? "true" : "false");
+    fprintf(file, "backup_interval = %d\n", backup_interval);
+
+    fclose(file);
     g_free((gpointer)log_level);
+
+    // Show success message
+    GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_INFO,
+                                              GTK_BUTTONS_OK,
+                                              "Settings saved successfully!");
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
 }
 
 // Modify create_main_window to include admin features
@@ -1432,22 +1822,76 @@ void create_main_window() {
     }
 }
 
-int main(int argc, char *argv[]) {
+// Handle database errors
+void handle_database_error(MYSQL *conn, const char *operation) {
+    const char *error = mysql_error(conn);
+    GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                                              GTK_DIALOG_MODAL,
+                                              GTK_MESSAGE_ERROR,
+                                              GTK_BUTTONS_OK,
+                                              "Database Error during %s: %s", operation, error);
+    gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+// Initialize database connection
+int init_database(void) {
     conn = mysql_init(NULL);
     if (!conn) {
         g_print("mysql_init() failed\n");
-        return 1;
+        return 0;
     }
 
+    // Set connection timeout
+    int timeout = 10;
+    mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+
+    // Enable automatic reconnection
+    my_bool reconnect = 1;
+    mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+
+    // Connect to database
     if (!mysql_real_connect(conn, HOST, USER, PASS, DB, 0, NULL, 0)) {
         g_print("MySQL connection failed: %s\n", mysql_error(conn));
+        return 0;
+    }
+
+    // Set character set
+    if (mysql_set_character_set(conn, "utf8mb4")) {
+        g_print("Failed to set character set: %s\n", mysql_error(conn));
+        return 0;
+    }
+
+    return 1;
+}
+
+// Main function with proper initialization and cleanup
+int main(int argc, char *argv[]) {
+    // Initialize GTK
+    gtk_init(&argc, &argv);
+
+    // Initialize database connection
+    if (!init_database()) {
+        GtkWidget *dialog = gtk_message_dialog_new(NULL,
+                                                  GTK_DIALOG_MODAL,
+                                                  GTK_MESSAGE_ERROR,
+                                                  GTK_BUTTONS_OK,
+                                                  "Failed to initialize database connection!");
+        gtk_dialog_run(GTK_DIALOG(dialog));
+        gtk_widget_destroy(dialog);
         return 1;
     }
 
-    gtk_init(&argc, &argv);
+    // Show login window
     show_login_window();
+
+    // Start GTK main loop
     gtk_main();
 
-    mysql_close(conn);
+    // Cleanup
+    if (conn) {
+        mysql_close(conn);
+    }
+
     return 0;
 }
